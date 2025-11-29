@@ -2,6 +2,7 @@
 
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faBell } from '@fortawesome/free-solid-svg-icons';
+import WalletPanel from './WalletPanel';
 
 interface HeaderProps {
   title: string;
@@ -16,6 +17,7 @@ export default function Header({ title }: HeaderProps) {
           <FontAwesomeIcon icon={faBell} className="mr-2 text-warning" />
           3 Alerts
         </button>
+        <WalletPanel />
       </div>
     </header>
   );

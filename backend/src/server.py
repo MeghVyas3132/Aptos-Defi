@@ -6,8 +6,8 @@ FastAPI server providing endpoints for:
 - Real-time crypto price streaming via WebSocket/SSE
 - Simulated trade execution
 - Price alerts management
-
-This is a SIMULATION/DEMO backend - no actual blockchain transactions occur.
+- User authentication via wallet
+- Aptos blockchain integration
 
 Endpoints:
     POST /ai/parse         - Parse natural language trading instructions
@@ -18,6 +18,11 @@ Endpoints:
     POST /alerts           - Create a price alert
     GET  /alerts           - List all alerts
     DELETE /alerts/{id}    - Cancel/delete an alert
+    POST /auth/login       - Login with wallet
+    POST /auth/logout      - Logout and invalidate session
+    GET  /auth/session     - Validate session
+    GET  /wallet/balance   - Get wallet balance
+    POST /wallet/faucet    - Request testnet tokens
 """
 
 import os
@@ -25,9 +30,9 @@ import json
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Optional, AsyncGenerator
+from typing import Optional, AsyncGenerator, List
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -66,6 +71,29 @@ from src.engine.alert_engine import (
     delete_alert,
     start_background_worker,
     stop_background_worker,
+)
+
+# Database and Blockchain imports
+from src.database.models import (
+    create_user,
+    get_user_by_address,
+    get_all_users,
+    create_session,
+    validate_session,
+    delete_session,
+    delete_all_user_sessions,
+    record_trade,
+    get_user_trades,
+    User,
+)
+from src.blockchain.aptos import (
+    AptosNetwork,
+    verify_wallet_address,
+    get_wallet_balance,
+    fund_from_faucet,
+    get_account_transactions,
+    get_explorer_url,
+    get_onboarding_info,
 )
 
 
@@ -627,6 +655,261 @@ async def delete_alert_endpoint(alert_id: str, cancel_only: bool = False):
 
 
 # ============================================================================
+# Authentication Endpoints
+# ============================================================================
+
+class LoginRequest(BaseModel):
+    """Request for wallet login."""
+    wallet_address: str
+    wallet_type: str = "petra"
+    network: str = "testnet"
+    signature: Optional[str] = None  # For signature verification
+
+
+class LoginResponse(BaseModel):
+    """Response from login."""
+    success: bool
+    session_token: Optional[str] = None
+    user: Optional[dict] = None
+    message: str
+
+
+@app.post("/auth/login", response_model=LoginResponse)
+async def login_with_wallet(request: LoginRequest, req: Request):
+    """
+    Login with a wallet address.
+    
+    In production, this should verify a signed message from the wallet.
+    For hackathon demo, we trust the wallet address from the frontend.
+    """
+    # Validate wallet address format
+    if not await verify_wallet_address(request.wallet_address):
+        raise HTTPException(
+            status_code=400, 
+            detail="Invalid Aptos wallet address format"
+        )
+    
+    # Create or get user
+    user = create_user(
+        wallet_address=request.wallet_address,
+        wallet_type=request.wallet_type,
+        network=request.network
+    )
+    
+    if not user:
+        raise HTTPException(status_code=500, detail="Failed to create user")
+    
+    # Create session
+    ip_address = req.client.host if req.client else None
+    user_agent = req.headers.get("user-agent")
+    
+    session_token = create_session(
+        user_id=user.id,
+        expires_hours=24,
+        ip_address=ip_address,
+        user_agent=user_agent
+    )
+    
+    if not session_token:
+        raise HTTPException(status_code=500, detail="Failed to create session")
+    
+    return LoginResponse(
+        success=True,
+        session_token=session_token,
+        user=user.to_dict(),
+        message="Login successful"
+    )
+
+
+@app.post("/auth/logout")
+async def logout(authorization: Optional[str] = Header(None)):
+    """Logout and invalidate session."""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="No session token provided")
+    
+    token = authorization.replace("Bearer ", "")
+    
+    if delete_session(token):
+        return {"success": True, "message": "Logged out successfully"}
+    else:
+        return {"success": False, "message": "Session not found or already expired"}
+
+
+@app.get("/auth/session")
+async def validate_session_endpoint(authorization: Optional[str] = Header(None)):
+    """Validate current session and return user info."""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="No session token provided")
+    
+    token = authorization.replace("Bearer ", "")
+    user = validate_session(token)
+    
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    
+    return {
+        "valid": True,
+        "user": user.to_dict()
+    }
+
+
+@app.get("/auth/users")
+async def list_all_users():
+    """Get all registered users (admin endpoint)."""
+    users = get_all_users()
+    return {
+        "count": len(users),
+        "users": [u.to_dict() for u in users]
+    }
+
+
+# ============================================================================
+# Wallet & Blockchain Endpoints
+# ============================================================================
+
+@app.get("/wallet/balance/{address}")
+async def get_wallet_balance_endpoint(
+    address: str, 
+    network: str = "testnet"
+):
+    """Get wallet balance from Aptos blockchain."""
+    # Validate address
+    if not await verify_wallet_address(address):
+        raise HTTPException(status_code=400, detail="Invalid wallet address")
+    
+    # Get network enum
+    try:
+        net = AptosNetwork(network)
+    except ValueError:
+        net = AptosNetwork.TESTNET
+    
+    # Get APT price for USD conversion
+    apt_price = None
+    service = get_price_service()
+    if service:
+        price_data = service.get_price("APT")
+        if price_data:
+            apt_price = price_data.price
+    
+    balance = await get_wallet_balance(address, net, apt_price)
+    
+    if not balance:
+        raise HTTPException(status_code=404, detail="Could not fetch wallet balance")
+    
+    return {
+        "address": address,
+        "network": network,
+        "apt_balance": balance.apt_balance,
+        "apt_balance_octas": balance.apt_balance_octas,
+        "usd_value": balance.usd_value,
+        "apt_price": apt_price
+    }
+
+
+class FaucetRequest(BaseModel):
+    """Request tokens from faucet."""
+    address: str
+    amount_apt: float = 1.0
+    network: str = "testnet"
+
+
+@app.post("/wallet/faucet")
+async def request_faucet_tokens(request: FaucetRequest):
+    """
+    Request free testnet/devnet tokens from the Aptos faucet.
+    
+    This only works on testnet and devnet, not mainnet.
+    """
+    # Validate address
+    if not await verify_wallet_address(request.address):
+        raise HTTPException(status_code=400, detail="Invalid wallet address")
+    
+    # Get network
+    try:
+        net = AptosNetwork(request.network)
+    except ValueError:
+        net = AptosNetwork.TESTNET
+    
+    if net == AptosNetwork.MAINNET:
+        raise HTTPException(
+            status_code=400, 
+            detail="Faucet not available on mainnet. Please acquire APT through an exchange."
+        )
+    
+    # Request from faucet
+    result = await fund_from_faucet(
+        address=request.address,
+        amount_apt=request.amount_apt,
+        network=net
+    )
+    
+    # Return the result (includes helpful info even if API fails)
+    return result
+
+
+@app.get("/wallet/transactions/{address}")
+async def get_wallet_transactions(
+    address: str,
+    network: str = "testnet",
+    limit: int = 25
+):
+    """Get recent transactions for a wallet."""
+    if not await verify_wallet_address(address):
+        raise HTTPException(status_code=400, detail="Invalid wallet address")
+    
+    try:
+        net = AptosNetwork(network)
+    except ValueError:
+        net = AptosNetwork.TESTNET
+    
+    transactions = await get_account_transactions(address, net, limit)
+    
+    return {
+        "address": address,
+        "network": network,
+        "count": len(transactions),
+        "transactions": transactions,
+        "explorer_url": get_explorer_url(address=address, network=net)
+    }
+
+
+@app.get("/onboarding")
+async def get_onboarding():
+    """
+    Get onboarding information for new users.
+    Includes wallet setup guide, faucet links, etc.
+    """
+    return get_onboarding_info()
+
+
+# ============================================================================
+# Trade History Endpoints
+# ============================================================================
+
+@app.get("/trades/history")
+async def get_trade_history(
+    authorization: Optional[str] = Header(None),
+    limit: int = 50
+):
+    """Get trade history for authenticated user."""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
+    token = authorization.replace("Bearer ", "")
+    user = validate_session(token)
+    
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid session")
+    
+    trades = get_user_trades(user.id, limit)
+    
+    return {
+        "count": len(trades),
+        "trades": [t.to_dict() for t in trades]
+    }
+
+
+# ============================================================================
 # Main Entry Point
 # ============================================================================
 
@@ -636,5 +919,5 @@ if __name__ == "__main__":
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
     
-    print(f"🚀 Starting Trade.apt server on {host}:{port}")
+    print(f"Starting Trade.apt server on {host}:{port}")
     uvicorn.run(app, host=host, port=port)
