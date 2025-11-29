@@ -1,13 +1,16 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import { faRobot, faPaperPlane, faWallet, faShieldAlt, faCheckCircle, faTimesCircle } from '@fortawesome/free-solid-svg-icons';
+import { faRobot, faPaperPlane, faWallet, faShieldAlt, faCheckCircle, faTimesCircle, faCircle, faChartLine } from '@fortawesome/free-solid-svg-icons';
+import { usePrices } from '@/context/PriceContext';
 
 interface Message {
-  type: 'bot' | 'user' | 'approval';
+  type: 'bot' | 'user' | 'approval' | 'live-price';
   content: string;
   trade?: TradeData;
+  priceSymbols?: string[]; // Tokens mentioned in this message for live updates
+  timestamp?: number;
 }
 
 interface TradeData {
@@ -16,6 +19,7 @@ interface TradeData {
   tokenFrom: string;
   tokenTo: string;
   amountUsd: number;
+  priceAtRequest?: number; // Price when user made the request
   conditions: {
     type: string;
     operator: string | null;
@@ -23,16 +27,103 @@ interface TradeData {
   };
 }
 
-export default function Chatbot() {
+interface ChatbotProps {
+  onOpenCharts?: (tokens: string[]) => void;
+}
+
+// Comprehensive list of tokens to detect
+const DETECTABLE_TOKENS = [
+  'BTC', 'ETH', 'SOL', 'APT', 'BNB', 'XRP', 'ADA', 'DOGE', 'AVAX', 'DOT',
+  'MATIC', 'LINK', 'UNI', 'ATOM', 'LTC', 'BCH', 'XLM', 'ALGO', 'VET', 'FIL',
+  'NEAR', 'OP', 'ARB', 'INJ', 'SUI', 'SEI', 'TIA', 'PEPE', 'SHIB', 'BONK',
+  'ETC', 'FTM', 'AAVE', 'CRV', 'MKR', 'COMP', 'SNX', 'LDO', 'RPL', 'GMX',
+  'DYDX', '1INCH', 'SUSHI', 'BAL', 'YFI', 'ENS', 'APE', 'SAND', 'MANA',
+  'AXS', 'GALA', 'IMX', 'RNDR', 'FET', 'AGIX', 'OCEAN', 'TRX', 'TON', 'HBAR',
+];
+
+// Helper to extract token symbols from text
+function extractTokenSymbols(text: string): string[] {
+  const found: string[] = [];
+  const upper = text.toUpperCase();
+  
+  // Also detect full names
+  const tokenNameMap: Record<string, string> = {
+    'BITCOIN': 'BTC',
+    'ETHEREUM': 'ETH',
+    'SOLANA': 'SOL',
+    'APTOS': 'APT',
+    'BINANCE': 'BNB',
+    'RIPPLE': 'XRP',
+    'CARDANO': 'ADA',
+    'DOGECOIN': 'DOGE',
+    'AVALANCHE': 'AVAX',
+    'POLKADOT': 'DOT',
+    'POLYGON': 'MATIC',
+    'CHAINLINK': 'LINK',
+    'UNISWAP': 'UNI',
+    'COSMOS': 'ATOM',
+    'LITECOIN': 'LTC',
+    'STELLAR': 'XLM',
+    'ALGORAND': 'ALGO',
+    'FILECOIN': 'FIL',
+    'FANTOM': 'FTM',
+    'AAVE': 'AAVE',
+    'CURVE': 'CRV',
+    'MAKER': 'MKR',
+    'COMPOUND': 'COMP',
+    'SYNTHETIX': 'SNX',
+  };
+  
+  // Check for full names first
+  for (const [name, symbol] of Object.entries(tokenNameMap)) {
+    if (upper.includes(name) && !found.includes(symbol)) {
+      found.push(symbol);
+    }
+  }
+  
+  // Check for symbols
+  for (const token of DETECTABLE_TOKENS) {
+    // Use word boundary matching to avoid false positives
+    const regex = new RegExp(`\\b${token}\\b`, 'i');
+    if (regex.test(text) && !found.includes(token)) {
+      found.push(token);
+    }
+  }
+  
+  return found;
+}
+
+// Detect if user is asking about price/chart/analysis
+function shouldOpenChart(text: string): boolean {
+  const chartKeywords = [
+    'price', 'chart', 'show me', 'what is', 'how much', 'worth',
+    'analyze', 'analysis', 'trend', 'graph', 'history', 'compare',
+    'buy', 'sell', 'trade', 'market', 'performance', 'look at'
+  ];
+  const lower = text.toLowerCase();
+  return chartKeywords.some(kw => lower.includes(kw));
+}
+
+export default function Chatbot({ onOpenCharts }: ChatbotProps) {
+  const { prices, isConnected: pricesConnected, getFormattedPrice, getPriceChange } = usePrices();
+  
   const [messages, setMessages] = useState<Message[]>([
     {
       type: 'bot',
-      content: '👋 Hey! I\'m your AI trading assistant.\n\n🔒 **Your Security:**\n• I only *parse* your requests - I never access your wallet\n• All trades require YOUR approval in your wallet\n• Your private keys stay with YOU\n\nConnect your wallet to start trading, or ask me about prices!',
+      content: '👋 Hey! I\'m your AI trading assistant with **LIVE** prices!\n\n🔒 **Your Security:**\n• I only *parse* your requests - I never access your wallet\n• All trades require YOUR approval in your wallet\n• Your private keys stay with YOU\n\n📊 **Live Prices** update in real-time!\n\nConnect your wallet to start trading, or ask me about prices!',
+      priceSymbols: ['BTC', 'ETH', 'APT'],
+      timestamp: Date.now(),
     },
   ]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Auto-scroll to bottom
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
 
   // Check for Petra wallet on mount
   useEffect(() => {
@@ -132,8 +223,11 @@ export default function Chatbot() {
     if (!input.trim()) return;
 
     const userMessage = input.trim();
+    const mentionedTokens = extractTokenSymbols(userMessage);
+    const userWantsChart = shouldOpenChart(userMessage);
+    
     setInput('');
-    setMessages(prev => [...prev, { type: 'user', content: userMessage }]);
+    setMessages((prev: Message[]) => [...prev, { type: 'user', content: userMessage }]);
     setIsLoading(true);
 
     try {
@@ -148,28 +242,92 @@ export default function Chatbot() {
       if (data.success) {
         let botResponse = data.message || 'I understood your request.';
         
-        // If there's a trade, show approval UI
-        if (data.parsed && data.parsed.action) {
-          const trade = data.parsed as TradeData;
+        // Add warnings if any
+        if (data.warnings && data.warnings.length > 0) {
+          botResponse += '\n\n' + data.warnings.map((w: string) => `⚠️ ${w}`).join('\n');
+        }
+        
+        // Add suggestions if any
+        if (data.suggestions && data.suggestions.length > 0) {
+          botResponse += '\n\n💡 **Suggestions:**\n' + data.suggestions.map((s: string) => `• ${s}`).join('\n');
+        }
+        
+        // Extract tokens mentioned in response for live price updates
+        const responseTokens = extractTokenSymbols(botResponse);
+        const allTokens = Array.from(new Set([...mentionedTokens, ...responseTokens]));
+        
+        // Open charts if user asked about tokens and mentioned price/chart keywords
+        if (userWantsChart && allTokens.length > 0 && onOpenCharts) {
+          onOpenCharts(allTokens);
+        }
+        
+        // If there's an action that requires confirmation
+        if (data.parsed && data.parsed.type && data.parsed.type !== 'none') {
+          const action = data.parsed;
           
-          // Add the conversational response
-          setMessages(prev => [...prev, { type: 'bot', content: botResponse }]);
+          // Get current live price for the trade token
+          const tradeToken = action.token_to || action.token_from || 'APT';
+          const currentPrice = prices[tradeToken]?.price || null;
           
-          // Add approval message with buttons
-          const approvalMsg = `🔐 **Approval Required**\n\nI've prepared this trade:\n• **Action:** ${trade.action.toUpperCase()}\n• **Token:** ${trade.action === 'sell' ? trade.tokenFrom : trade.tokenTo}\n• **Amount:** ${trade.amountUsd > 0 ? '$' + trade.amountUsd.toLocaleString() : 'To be specified'}\n• **Type:** ${trade.conditions.type === 'price_trigger' ? `Conditional (${trade.conditions.operator} $${trade.conditions.value})` : 'Market Order'}\n\n⚠️ **Your wallet will ask you to sign.**\nI cannot access your funds - only YOU can approve this.`;
+          // Open chart for trade tokens
+          const tradeTokens = [action.token_from, action.token_to].filter(Boolean);
+          if (onOpenCharts && tradeTokens.length > 0) {
+            onOpenCharts(tradeTokens);
+          }
           
-          setMessages(prev => [...prev, { 
-            type: 'approval', 
-            content: approvalMsg,
-            trade: trade
+          // Add the conversational response with live prices
+          setMessages((prev: Message[]) => [...prev, { 
+            type: 'bot', 
+            content: botResponse,
+            priceSymbols: allTokens.length > 0 ? allTokens : undefined,
+            timestamp: Date.now()
           }]);
+          
+          // Build trade object for approval with price at request time
+          const trade: TradeData = {
+            intent: data.intent || 'trade',
+            action: action.type,
+            tokenFrom: action.token_from || 'USDC',
+            tokenTo: action.token_to || 'APT',
+            amountUsd: action.amount_usd || 0,
+            priceAtRequest: currentPrice ?? undefined, // Store price when user made request
+            conditions: {
+              type: action.condition?.type || 'immediate',
+              operator: action.condition?.type === 'price_below' ? '<' : action.condition?.type === 'price_above' ? '>' : null,
+              value: action.condition?.trigger_price || null
+            }
+          };
+          
+          // Only show approval if requires_confirmation
+          if (action.requires_confirmation) {
+            const riskEmoji = action.risk_level === 'high' ? '🔴' : action.risk_level === 'medium' ? '🟡' : '🟢';
+            const approvalMsg = `🔐 **Trade Confirmation Required** ${riskEmoji}\n\n` +
+              `• **Action:** ${trade.action.toUpperCase()}\n` +
+              `• **From:** ${trade.tokenFrom}\n` +
+              `• **To:** ${trade.tokenTo}\n` +
+              `• **Amount:** ${trade.amountUsd > 0 ? '$' + trade.amountUsd.toLocaleString() : 'To be specified'}\n` +
+              `• **Risk Level:** ${action.risk_level || 'low'}\n\n` +
+              `⚠️ **Your wallet will prompt you to sign.**\nI prepare trades - YOU approve them.`;
+            
+            setMessages((prev: Message[]) => [...prev, { 
+              type: 'approval', 
+              content: approvalMsg,
+              trade: trade
+            }]);
+          }
         } else {
-          setMessages(prev => [...prev, { type: 'bot', content: botResponse }]);
+          // Regular bot response with live price symbols
+          setMessages((prev: Message[]) => [...prev, { 
+            type: 'bot', 
+            content: botResponse,
+            priceSymbols: allTokens.length > 0 ? allTokens : undefined,
+            timestamp: Date.now()
+          }]);
         }
       } else {
-        setMessages(prev => [...prev, { 
+        setMessages((prev: Message[]) => [...prev, { 
           type: 'bot', 
-          content: data.error || 'Sorry, I couldn\'t process that. Try asking about crypto prices or making a trade!' 
+          content: data.message || data.error || 'Sorry, I couldn\'t process that. Try asking about crypto prices or making a trade!' 
         }]);
       }
     } catch (error) {
@@ -221,13 +379,43 @@ export default function Chatbot() {
         </button>
       </div>
 
-      {/* Trust Banner */}
-      <div className="px-3 py-2 bg-green-500/10 border-b border-green-500/20">
+      {/* Trust Banner with Live Status */}
+      <div className="px-3 py-2 bg-green-500/10 border-b border-green-500/20 flex justify-between items-center">
         <p className="text-[10px] text-green-400 flex items-center gap-2">
           <FontAwesomeIcon icon={faShieldAlt} />
-          AI parses only • Your keys stay with you • Wallet approval required
+          AI parses only • Your keys stay with you
         </p>
+        <div className="flex items-center gap-1.5">
+          <FontAwesomeIcon 
+            icon={faCircle} 
+            className={`text-[6px] ${pricesConnected ? 'text-green-500 animate-pulse' : 'text-red-500'}`} 
+          />
+          <span className={`text-[10px] ${pricesConnected ? 'text-green-400' : 'text-red-400'}`}>
+            {pricesConnected ? 'LIVE PRICES' : 'CONNECTING...'}
+          </span>
+        </div>
       </div>
+
+      {/* Live Price Bar */}
+      {pricesConnected && (
+        <div className="px-3 py-1.5 bg-gray-900/50 border-b border-gray-800 flex gap-4 overflow-x-auto text-[10px]">
+          {['BTC', 'ETH', 'SOL', 'APT'].map((symbol) => {
+            const change = getPriceChange(symbol);
+            const isPositive = change >= 0;
+            return (
+              <div key={symbol} className="flex items-center gap-1.5 shrink-0">
+                <span className="text-gray-500">{symbol}</span>
+                <span className={isPositive ? 'text-green-400' : 'text-red-400'}>
+                  {getFormattedPrice(symbol)}
+                </span>
+                <span className={`${isPositive ? 'text-green-600' : 'text-red-600'}`}>
+                  {isPositive ? '↑' : '↓'}{Math.abs(change).toFixed(1)}%
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
 
       {/* Chat History */}
       <div className="flex-grow p-4 overflow-y-auto space-y-4">
@@ -244,23 +432,65 @@ export default function Chatbot() {
             >
               {message.content}
               
-              {/* Approval Buttons */}
+              {/* Show live prices for tokens mentioned in message */}
+              {message.type === 'bot' && message.priceSymbols && message.priceSymbols.length > 0 && (
+                <div className="mt-2 pt-2 border-t border-gray-700">
+                  <div className="flex flex-wrap gap-2">
+                    {message.priceSymbols.map((symbol) => {
+                      const change = getPriceChange(symbol);
+                      const isPositive = change >= 0;
+                      return (
+                        <div key={symbol} className="flex items-center gap-1 bg-gray-900 px-2 py-1 rounded">
+                          <span className="text-gray-400">{symbol}:</span>
+                          <span className={`font-bold ${isPositive ? 'text-green-400' : 'text-red-400'}`}>
+                            {getFormattedPrice(symbol)}
+                          </span>
+                          <span className={`text-[10px] ${isPositive ? 'text-green-600' : 'text-red-600'}`}>
+                            {isPositive ? '↑' : '↓'}{Math.abs(change).toFixed(2)}%
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <p className="text-[9px] text-gray-600 mt-1">🔴 Live • Updates automatically</p>
+                </div>
+              )}
+              
+              {/* Approval Buttons with Live Price */}
               {message.type === 'approval' && message.trade && (
-                <div className="mt-3 flex gap-2">
-                  <button
-                    onClick={() => handleApprove(message.trade!)}
-                    className="flex-1 bg-green-500 hover:bg-green-600 text-white py-2 px-3 rounded-lg text-xs font-bold flex items-center justify-center gap-2 transition"
-                  >
-                    <FontAwesomeIcon icon={faCheckCircle} />
-                    Approve & Sign
-                  </button>
-                  <button
-                    onClick={handleReject}
-                    className="flex-1 bg-red-500/20 hover:bg-red-500/30 text-red-400 py-2 px-3 rounded-lg text-xs font-bold flex items-center justify-center gap-2 transition border border-red-500/30"
-                  >
-                    <FontAwesomeIcon icon={faTimesCircle} />
-                    Cancel
-                  </button>
+                <div className="mt-3">
+                  {/* Show current live price vs requested price */}
+                  <div className="mb-2 p-2 bg-gray-900 rounded text-[10px]">
+                    <div className="flex justify-between">
+                      <span className="text-gray-400">Current {message.trade.tokenTo || message.trade.tokenFrom} Price:</span>
+                      <span className="text-green-400 font-bold">
+                        {getFormattedPrice(message.trade.tokenTo || message.trade.tokenFrom)}
+                      </span>
+                    </div>
+                    {message.trade.priceAtRequest && (
+                      <div className="flex justify-between mt-1">
+                        <span className="text-gray-500">Price when requested:</span>
+                        <span className="text-gray-400">${message.trade.priceAtRequest.toLocaleString()}</span>
+                      </div>
+                    )}
+                  </div>
+                  
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => handleApprove(message.trade!)}
+                      className="flex-1 bg-green-500 hover:bg-green-600 text-white py-2 px-3 rounded-lg text-xs font-bold flex items-center justify-center gap-2 transition"
+                    >
+                      <FontAwesomeIcon icon={faCheckCircle} />
+                      Approve & Sign
+                    </button>
+                    <button
+                      onClick={handleReject}
+                      className="flex-1 bg-red-500/20 hover:bg-red-500/30 text-red-400 py-2 px-3 rounded-lg text-xs font-bold flex items-center justify-center gap-2 transition border border-red-500/30"
+                    >
+                      <FontAwesomeIcon icon={faTimesCircle} />
+                      Cancel
+                    </button>
+                  </div>
                 </div>
               )}
             </div>
@@ -273,6 +503,7 @@ export default function Chatbot() {
             </div>
           </div>
         )}
+        <div ref={messagesEndRef} />
       </div>
 
       {/* Chat Input */}

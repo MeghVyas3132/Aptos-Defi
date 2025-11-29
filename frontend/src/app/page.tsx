@@ -1,10 +1,11 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import Sidebar from '@/components/Sidebar';
 import Header from '@/components/Header';
 import Ticker from '@/components/Ticker';
 import Chatbot from '@/components/Chatbot';
+import ChartPanel from '@/components/ChartPanel';
 import HomeView from '@/components/views/HomeView';
 import AuditLogsView from '@/components/views/AuditLogsView';
 import PlaceholderView from '@/components/views/PlaceholderView';
@@ -13,6 +14,30 @@ export type ViewType = 'home' | 'my_account' | 'portfolio' | 'audit_logs' | 'fin
 
 export default function Home() {
   const [currentView, setCurrentView] = useState<ViewType>('home');
+  const [chartTokens, setChartTokens] = useState<string[]>([]);
+  const [showCharts, setShowCharts] = useState(false);
+
+  // Function to open charts (called from Chatbot via callback)
+  const handleOpenCharts = useCallback((tokens: string[]) => {
+    if (tokens.length > 0) {
+      setChartTokens((prev) => {
+        const newTokens = [...prev];
+        tokens.forEach((t) => {
+          const upper = t.toUpperCase();
+          if (!newTokens.includes(upper)) {
+            newTokens.push(upper);
+          }
+        });
+        return newTokens;
+      });
+      setShowCharts(true);
+    }
+  }, []);
+
+  const handleCloseCharts = useCallback(() => {
+    setShowCharts(false);
+    setChartTokens([]);
+  }, []);
 
   const getPageTitle = () => {
     switch (currentView) {
@@ -49,7 +74,7 @@ export default function Home() {
   };
 
   return (
-    <div className="grid grid-cols-[200px_1fr_320px] grid-rows-[100vh] w-screen h-screen">
+    <div className={`grid ${showCharts ? 'grid-cols-[200px_1fr_400px_320px]' : 'grid-cols-[200px_1fr_320px]'} grid-rows-[100vh] w-screen h-screen transition-all duration-300`}>
       {/* Left Column: Navigation */}
       <Sidebar currentView={currentView} onNavigate={setCurrentView} />
 
@@ -62,8 +87,18 @@ export default function Home() {
         </div>
       </main>
 
+      {/* Chart Panel (conditionally rendered) */}
+      {showCharts && chartTokens.length > 0 && (
+        <div className="h-full overflow-hidden border-r border-gray-800">
+          <ChartPanel 
+            initialTokens={chartTokens} 
+            onClose={handleCloseCharts}
+          />
+        </div>
+      )}
+
       {/* Right Column: AI Chatbot */}
-      <Chatbot />
+      <Chatbot onOpenCharts={handleOpenCharts} />
     </div>
   );
 }

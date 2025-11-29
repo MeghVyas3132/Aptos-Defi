@@ -3,7 +3,7 @@ Trade.apt - DeFi Trading Assistant Server
 ==========================================
 FastAPI server providing endpoints for:
 - AI-powered natural language trade parsing
-- Real-time crypto price fetching
+- Real-time crypto price streaming via WebSocket/SSE
 - Simulated trade execution
 - Price alerts management
 
@@ -11,20 +11,25 @@ This is a SIMULATION/DEMO backend - no actual blockchain transactions occur.
 
 Endpoints:
     POST /ai/parse         - Parse natural language trading instructions
+    GET  /ai/stream        - SSE stream for live AI updates
     POST /trade/execute    - Execute a parsed trade (simulated)
     GET  /price/{token}    - Get real-time token price
+    GET  /prices/stream    - SSE stream for live price updates
     POST /alerts           - Create a price alert
     GET  /alerts           - List all alerts
     DELETE /alerts/{id}    - Cancel/delete an alert
 """
 
 import os
+import json
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Optional
+from typing import Optional, AsyncGenerator
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -33,7 +38,16 @@ load_dotenv()
 
 # Import our modules
 from src.ai.parser import parse_user_request, parse_user_request_mock, chat_with_ai
+from src.ai.agent import process_message as ai_agent_process
 from src.api.price import get_token_price, get_token_info, get_supported_tokens, get_multiple_prices
+from src.api.websocket_price import (
+    get_price_service,
+    start_price_service,
+    stop_price_service,
+    RealTimePriceService,
+    PriceData,
+)
+from src.api.chart_data import get_chart_data
 from src.engine.trade_engine import (
     TradeRequest,
     TradeCondition,
@@ -115,10 +129,16 @@ class HealthResponse(BaseModel):
 async def lifespan(app: FastAPI):
     """
     Application lifespan handler.
-    Starts background worker on startup, stops on shutdown.
+    Starts background worker and real-time price service on startup.
     """
     # Startup
     print("🚀 Trade.apt server starting...")
+    
+    # Start real-time price service (Binance WebSocket)
+    await start_price_service()
+    print("✅ Real-time price service started (Binance WebSocket)")
+    
+    # Start background worker for alerts
     start_background_worker()
     print("✅ Background worker started")
     
@@ -126,6 +146,8 @@ async def lifespan(app: FastAPI):
     
     # Shutdown
     print("🛑 Shutting down...")
+    await stop_price_service()
+    print("✅ Real-time price service stopped")
     stop_background_worker()
     print("✅ Background worker stopped")
 
@@ -179,48 +201,58 @@ async def health_check():
 # AI Parsing Endpoints
 # ----------------------------------------------------------------------------
 
-@app.post("/ai/parse", response_model=ParseResponse)
+@app.post("/ai/parse")
 async def parse_trading_instruction(request: ParseRequest):
     """
-    Conversational AI endpoint that understands natural language.
+    Autonomous AI Agent endpoint.
     
-    Fetches real-time prices and provides natural responses.
-    Can handle price queries, trade requests, and general chat.
+    Handles all trading requests with full context awareness,
+    risk assessment, and comprehensive response formatting.
     
-    Example inputs:
-        {"text": "what's the price of bitcoin?"}
-        {"text": "buy $20 APT if price drops to $7"}
-        {"text": "hello"}
-    
-    Example output:
-        {
-            "success": true,
-            "message": "Bitcoin (BTC) is currently at $97,234! 📈 Would you like to buy some?",
-            "parsed": null,
-            "original_text": "what's the price of bitcoin?"
-        }
+    The AI agent:
+    - Understands natural language trading instructions
+    - Provides real-time price data
+    - Assesses risk and provides warnings
+    - Handles edge cases and errors gracefully
+    - Never executes without user confirmation
     """
     try:
         # Fetch real-time prices for context
-        top_tokens = ["BTC", "ETH", "APT", "SOL", "BNB", "XRP", "ADA", "DOGE"]
+        top_tokens = ["BTC", "ETH", "APT", "SOL", "BNB", "XRP", "ADA", "DOGE", "AVAX", "DOT"]
         prices = await get_multiple_prices(top_tokens)
         
-        # Use conversational AI
-        result = await chat_with_ai(request.text, prices)
+        # Filter out None values and format prices
+        clean_prices = {k: v for k, v in prices.items() if v is not None}
         
-        return ParseResponse(
-            success=True,
-            message=result.get("message"),
-            parsed=result.get("trade"),
-            original_text=request.text
+        # Use the new AI agent
+        result = await ai_agent_process(
+            user_message=request.text,
+            prices=clean_prices,
+            wallet=None,  # Will be passed from frontend when available
+            pending_orders=None,
+            alerts=None
         )
+        
+        # Format response for frontend compatibility
+        return {
+            "success": True,
+            "message": result.get("message", ""),
+            "parsed": result.get("action") if result.get("action", {}).get("type") != "none" else None,
+            "intent": result.get("intent", "chat"),
+            "warnings": result.get("warnings", []),
+            "suggestions": result.get("suggestions", []),
+            "market_context": result.get("market_context"),
+            "original_text": request.text
+        }
         
     except Exception as e:
-        return ParseResponse(
-            success=False,
-            error=str(e),
-            original_text=request.text
-        )
+        print(f"AI Agent error: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "I'm having trouble processing your request. Please try again.",
+            "original_text": request.text
+        }
 
 
 # ----------------------------------------------------------------------------
@@ -310,11 +342,24 @@ async def cancel_pending_trade_endpoint(trade_id: str):
 @app.get("/price/{token}", response_model=PriceResponse)
 async def get_price_endpoint(token: str):
     """
-    Get real-time price for a token.
+    Get real-time price for a token (from WebSocket cache, falls back to REST).
     
     Example: GET /price/APT
     Response: {"token": "APT", "price_usd": 8.45, "timestamp": "..."}
     """
+    # Try WebSocket cache first (real-time)
+    service = get_price_service()
+    price_data = service.get_price_data(token.upper())
+    
+    if price_data:
+        return PriceResponse(
+            token=token.upper(),
+            price_usd=price_data.price,
+            timestamp=price_data.last_update,
+            error=None
+        )
+    
+    # Fallback to REST API
     price = await get_token_price(token)
     
     return PriceResponse(
@@ -323,6 +368,108 @@ async def get_price_endpoint(token: str):
         timestamp=datetime.utcnow(),
         error=None if price else f"Could not fetch price for {token}"
     )
+
+
+@app.get("/prices/live")
+async def get_all_live_prices():
+    """
+    Get all live prices from WebSocket cache.
+    Returns real-time prices with metadata.
+    """
+    service = get_price_service()
+    prices = service.get_all_price_data()
+    
+    return {
+        "prices": {s: p.to_dict() for s, p in prices.items()},
+        "count": len(prices),
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+@app.get("/prices/stream")
+async def stream_prices(request: Request):
+    """
+    Server-Sent Events (SSE) endpoint for real-time price streaming.
+    
+    Frontend can subscribe to this endpoint to receive live price updates.
+    
+    Example (JavaScript):
+        const eventSource = new EventSource('/prices/stream');
+        eventSource.onmessage = (event) => {
+            const prices = JSON.parse(event.data);
+            console.log('Price update:', prices);
+        };
+    """
+    async def price_generator() -> AsyncGenerator[str, None]:
+        service = get_price_service()
+        queue: asyncio.Queue = asyncio.Queue()
+        
+        # Callback to add price updates to queue
+        async def on_price_update(symbol: str, price_data: PriceData):
+            await queue.put((symbol, price_data))
+        
+        # Register callback
+        service.on_price_update(on_price_update)
+        
+        try:
+            # Send initial prices
+            all_prices = service.get_all_price_data()
+            initial_data = {s: p.to_dict() for s, p in all_prices.items()}
+            yield f"data: {json.dumps({'type': 'initial', 'prices': initial_data})}\n\n"
+            
+            # Stream updates
+            while True:
+                # Check if client disconnected
+                if await request.is_disconnected():
+                    break
+                
+                try:
+                    # Wait for price update with timeout
+                    symbol, price_data = await asyncio.wait_for(queue.get(), timeout=1.0)
+                    update = {
+                        "type": "update",
+                        "symbol": symbol,
+                        "price": price_data.to_dict()
+                    }
+                    yield f"data: {json.dumps(update)}\n\n"
+                except asyncio.TimeoutError:
+                    # Send heartbeat to keep connection alive
+                    yield f"data: {json.dumps({'type': 'heartbeat', 'timestamp': datetime.utcnow().isoformat()})}\n\n"
+                    
+        finally:
+            # Cleanup callback
+            service.remove_callback(on_price_update)
+    
+    return StreamingResponse(
+        price_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"  # Disable nginx buffering
+        }
+    )
+
+
+@app.post("/prices/check-staleness")
+async def check_price_staleness(
+    symbol: str,
+    expected_price: float,
+    tolerance_percent: float = 2.0
+):
+    """
+    Check if current price is within tolerance of expected price.
+    Use this before executing trades to protect against price staleness.
+    
+    Returns:
+        is_valid: True if price is within tolerance
+        current_price: Current live price
+        deviation_percent: How much price has moved
+        message: Human-readable explanation
+    """
+    service = get_price_service()
+    result = service.check_price_staleness(symbol, expected_price, tolerance_percent)
+    return result
 
 
 @app.get("/price/{token}/info", response_model=TokenInfoResponse)
@@ -343,6 +490,65 @@ async def get_supported_tokens_endpoint():
     return {
         "count": len(tokens),
         "tokens": tokens
+    }
+
+
+# ----------------------------------------------------------------------------
+# Chart Data Endpoints
+# ----------------------------------------------------------------------------
+
+@app.get("/chart/{token}")
+async def get_chart_data_endpoint(token: str, days: int = 7):
+    """
+    Get historical OHLC chart data for a token.
+    
+    Args:
+        token: Token symbol (e.g., BTC, ETH, APT)
+        days: Number of days of history (1, 7, 30, 90, 365)
+    
+    Returns:
+        OHLC data with timestamps for charting
+    """
+    if days not in [1, 7, 30, 90, 365]:
+        days = 7  # Default to 7 days if invalid
+    
+    chart_data = await get_chart_data(token, days)
+    
+    if not chart_data or "error" in chart_data:
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Chart data not found for {token}"
+        )
+    
+    return chart_data
+
+
+@app.get("/chart/{token}/simple")
+async def get_simple_chart_data_endpoint(token: str, days: int = 7):
+    """
+    Get simplified price history for sparkline charts.
+    Returns just prices without OHLC detail.
+    """
+    chart_data = await get_chart_data(token, days)
+    
+    if not chart_data or "error" in chart_data:
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Chart data not found for {token}"
+        )
+    
+    # Extract just closing prices for simple charts
+    return {
+        "token": chart_data["token"],
+        "days": days,
+        "prices": chart_data["close"],
+        "timestamps": chart_data["timestamps"],
+        "current_price": chart_data["close"][-1] if chart_data["close"] else None,
+        "price_change_percent": (
+            ((chart_data["close"][-1] - chart_data["close"][0]) / chart_data["close"][0] * 100)
+            if chart_data["close"] and len(chart_data["close"]) > 1
+            else 0
+        )
     }
 
 
