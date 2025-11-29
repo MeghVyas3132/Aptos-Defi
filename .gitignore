@@ -1,0 +1,40 @@
+# Environment files with secrets
+.env
+*.env
+backend/.env
+frontend/.env
+frontend/.env.local
+
+# API keys
+api.txt
+*.key
+
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Build outputs
+.next/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.log
+
+# Python
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
