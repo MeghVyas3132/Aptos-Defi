@@ -13,7 +13,7 @@ export default function Chatbot() {
   const [messages, setMessages] = useState<Message[]>([
     {
       type: 'bot',
-      content: 'Ask me to analyze your portfolio, find a stock, or summarize today\'s audit logs.',
+      content: 'Hey! 👋 I\'m your AI trading assistant. Ask me about crypto prices, or tell me to buy/sell tokens!\n\nTry: "What\'s the price of Bitcoin?" or "Buy $50 of ETH"',
     },
   ]);
   const [input, setInput] = useState('');
@@ -37,12 +37,26 @@ export default function Chatbot() {
 
       const data = await response.json();
 
-      if (data.success && data.parsed) {
-        const parsed = data.parsed;
-        const botResponse = `I understood your request:\n• Action: ${parsed.action.toUpperCase()}\n• From: ${parsed.tokenFrom}\n• To: ${parsed.tokenTo}\n• Amount: $${parsed.amountUsd}\n• Condition: ${parsed.conditions.type === 'immediate' ? 'Execute immediately' : `${parsed.conditions.operator} $${parsed.conditions.value}`}`;
+      if (data.success) {
+        // Use the conversational message from the AI
+        let botResponse = data.message || 'I understood your request.';
+        
+        // If there's trade data, add a summary
+        if (data.parsed && data.parsed.action) {
+          const trade = data.parsed;
+          const conditionText = trade.conditions?.type === 'price_trigger' 
+            ? `\n\n📋 **Order Details:**\n• ${trade.action.toUpperCase()} ${trade.tokenTo || trade.tokenFrom}\n• Amount: $${trade.amountUsd || 'TBD'}\n• Condition: ${trade.conditions.operator} $${trade.conditions.value}`
+            : '';
+          
+          // Only add if not already in message
+          if (!botResponse.includes('Order Details') && conditionText) {
+            botResponse += conditionText;
+          }
+        }
+        
         setMessages((prev) => [...prev, { type: 'bot', content: botResponse }]);
       } else {
-        setMessages((prev) => [...prev, { type: 'bot', content: data.error || 'I couldn\'t understand that request. Try something like "buy $20 APT if price drops to $7".' }]);
+        setMessages((prev) => [...prev, { type: 'bot', content: data.error || 'Sorry, I couldn\'t process that. Try asking about crypto prices or making a trade!' }]);
       }
     } catch (error) {
       setMessages((prev) => [...prev, { type: 'bot', content: 'Sorry, I\'m having trouble connecting to the backend. Make sure the server is running.' }]);

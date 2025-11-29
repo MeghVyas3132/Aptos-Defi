@@ -32,8 +32,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Import our modules
-from src.ai.parser import parse_user_request, parse_user_request_mock
-from src.api.price import get_token_price, get_token_info, get_supported_tokens
+from src.ai.parser import parse_user_request, parse_user_request_mock, chat_with_ai
+from src.api.price import get_token_price, get_token_info, get_supported_tokens, get_multiple_prices
 from src.engine.trade_engine import (
     TradeRequest,
     TradeCondition,
@@ -67,7 +67,8 @@ class ParseRequest(BaseModel):
 class ParseResponse(BaseModel):
     """Response from /ai/parse endpoint."""
     success: bool
-    parsed: Optional[dict] = None
+    message: Optional[str] = None  # Conversational response
+    parsed: Optional[dict] = None  # Trade data if detected
     error: Optional[str] = None
     original_text: str
 
@@ -181,52 +182,45 @@ async def health_check():
 @app.post("/ai/parse", response_model=ParseResponse)
 async def parse_trading_instruction(request: ParseRequest):
     """
-    Parse natural language trading instruction into structured JSON.
+    Conversational AI endpoint that understands natural language.
     
-    Example input:
+    Fetches real-time prices and provides natural responses.
+    Can handle price queries, trade requests, and general chat.
+    
+    Example inputs:
+        {"text": "what's the price of bitcoin?"}
         {"text": "buy $20 APT if price drops to $7"}
+        {"text": "hello"}
     
     Example output:
         {
             "success": true,
-            "parsed": {
-                "action": "buy",
-                "tokenFrom": "USDC",
-                "tokenTo": "APT",
-                "amountUsd": 20,
-                "conditions": {
-                    "type": "price_trigger",
-                    "operator": "<",
-                    "value": 7
-                }
-            },
-            "original_text": "buy $20 APT if price drops to $7"
+            "message": "Bitcoin (BTC) is currently at $97,234! 📈 Would you like to buy some?",
+            "parsed": null,
+            "original_text": "what's the price of bitcoin?"
         }
     """
     try:
-        # Check if OpenAI API key is configured
-        if os.getenv("OPENAI_API_KEY") and os.getenv("OPENAI_API_KEY") != "your_openai_api_key_here":
-            # Use real OpenAI parsing
-            parsed = await parse_user_request(request.text)
-        else:
-            # Use mock parser for testing without API key
-            print("⚠️  No OpenAI API key configured, using mock parser")
-            parsed = await parse_user_request_mock(request.text)
+        # Fetch real-time prices for context
+        top_tokens = ["BTC", "ETH", "APT", "SOL", "BNB", "XRP", "ADA", "DOGE"]
+        prices = await get_multiple_prices(top_tokens)
+        
+        # Use conversational AI
+        result = await chat_with_ai(request.text, prices)
         
         return ParseResponse(
             success=True,
-            parsed=parsed,
+            message=result.get("message"),
+            parsed=result.get("trade"),
             original_text=request.text
         )
         
-    except ValueError as e:
+    except Exception as e:
         return ParseResponse(
             success=False,
             error=str(e),
             original_text=request.text
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI parsing error: {str(e)}")
 
 
 # ----------------------------------------------------------------------------
