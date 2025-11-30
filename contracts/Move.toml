@@ -1,0 +1,16 @@
+[package]
+name = "TradeApt"
+version = "1.0.0"
+authors = ["Trade.apt Team"]
+
+[addresses]
+trade_apt = "_"
+
+[dev-addresses]
+trade_apt = "0xf522b301773ca60d8e70f1e258708cbf0735eb6e38f22158563ad92c19c349ea"
+
+[dependencies]
+AptosFramework = { git = "https://github.com/aptos-labs/aptos-core.git", subdir = "aptos-move/framework/aptos-framework", rev = "mainnet" }
+AptosStdlib = { git = "https://github.com/aptos-labs/aptos-core.git", subdir = "aptos-move/framework/aptos-stdlib", rev = "mainnet" }
+
+[dev-dependencies]

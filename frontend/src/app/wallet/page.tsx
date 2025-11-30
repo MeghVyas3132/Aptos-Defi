@@ -3,75 +3,33 @@
 import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-
-interface WalletInfo {
-  address: string;
-  type: string;
-  network: 'mainnet' | 'testnet' | 'devnet';
-  balance: number;
-  usd_value: number | null;
-}
-
-interface Transaction {
-  hash: string;
-  type: string;
-  amount: number;
-  timestamp: string;
-}
+import { useWallet } from '@aptos-labs/wallet-adapter-react';
+import { getAccountBalance, formatAddress } from '@/utils/aptosClient';
+import { NETWORK, FAUCET_URL, EXPLORER_URL } from '@/constants';
 
 export default function WalletPage() {
   const router = useRouter();
-  const [wallet, setWallet] = useState<WalletInfo | null>(null);
+  const { connected, account, disconnect } = useWallet();
+  const [balance, setBalance] = useState<number>(0);
   const [isLoading, setIsLoading] = useState(true);
   const [isFaucetLoading, setIsFaucetLoading] = useState(false);
   const [faucetMessage, setFaucetMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
-  const [network, setNetwork] = useState<'mainnet' | 'testnet' | 'devnet'>('testnet');
 
   useEffect(() => {
-    const checkAuth = async () => {
-      const token = localStorage.getItem('session_token');
-      const address = localStorage.getItem('wallet_address');
-      const storedNetwork = localStorage.getItem('network') as 'mainnet' | 'testnet' | 'devnet';
-      const walletType = localStorage.getItem('wallet_type') || 'petra';
+    if (!connected || !account) {
+      router.push('/login');
+      return;
+    }
 
-      if (!token || !address) {
-        router.push('/login');
-        return;
-      }
+    loadBalance();
+  }, [connected, account, router]);
 
-      if (storedNetwork) {
-        setNetwork(storedNetwork);
-      }
-
-      await loadBalance(address, storedNetwork || 'testnet', walletType);
-    };
-
-    checkAuth();
-  }, [router]);
-
-  const loadBalance = async (address: string, net: string, walletType: string) => {
+  const loadBalance = async () => {
+    if (!account) return;
+    
     try {
-      const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
-      const response = await fetch(`${API_URL}/wallet/balance/${address}?network=${net}`);
-      
-      if (response.ok) {
-        const data = await response.json();
-        setWallet({
-          address,
-          type: walletType,
-          network: net as 'mainnet' | 'testnet' | 'devnet',
-          balance: data.apt_balance || 0,
-          usd_value: data.usd_value,
-        });
-      } else {
-        setWallet({
-          address,
-          type: walletType,
-          network: net as 'mainnet' | 'testnet' | 'devnet',
-          balance: 0,
-          usd_value: null,
-        });
-      }
+      const bal = await getAccountBalance(account.address);
+      setBalance(bal);
     } catch (error) {
       console.error('Failed to load balance:', error);
     } finally {
@@ -79,18 +37,8 @@ export default function WalletPage() {
     }
   };
 
-  const handleNetworkChange = async (newNetwork: 'mainnet' | 'testnet' | 'devnet') => {
-    setNetwork(newNetwork);
-    localStorage.setItem('network', newNetwork);
-
-    if (wallet) {
-      setIsLoading(true);
-      await loadBalance(wallet.address, newNetwork, wallet.type);
-    }
-  };
-
   const handleRequestFaucet = async () => {
-    if (!wallet || network === 'mainnet') return;
+    if (!account) return;
 
     setIsFaucetLoading(true);
     setFaucetMessage(null);
@@ -103,9 +51,9 @@ export default function WalletPage() {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          address: wallet.address,
+          address: account.address,
           amount_apt: 1,
-          network: network,
+          network: 'devnet',
         }),
       });
 
@@ -114,9 +62,7 @@ export default function WalletPage() {
       if (response.ok && data.success) {
         setFaucetMessage({ type: 'success', text: 'Successfully received 1 APT from faucet' });
         // Refresh balance after a delay
-        setTimeout(async () => {
-          await loadBalance(wallet.address, network, wallet.type);
-        }, 2000);
+        setTimeout(loadBalance, 2000);
       } else {
         setFaucetMessage({ type: 'error', text: data.error || 'Faucet request failed' });
       }
@@ -128,36 +74,19 @@ export default function WalletPage() {
   };
 
   const handleDisconnect = async () => {
-    const token = localStorage.getItem('session_token');
-    
-    if (token) {
-      try {
-        const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
-        await fetch(`${API_URL}/auth/logout`, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${token}`,
-          },
-        });
-      } catch (error) {
-        console.error('Logout error:', error);
-      }
+    try {
+      await disconnect();
+      localStorage.removeItem('wallet_address');
+      localStorage.removeItem('network');
+      router.push('/login');
+    } catch (error) {
+      console.error('Disconnect error:', error);
     }
-
-    localStorage.removeItem('session_token');
-    localStorage.removeItem('wallet_address');
-    localStorage.removeItem('wallet_type');
-    localStorage.removeItem('network');
-    router.push('/login');
-  };
-
-  const formatAddress = (address: string) => {
-    return `${address.slice(0, 10)}...${address.slice(-8)}`;
   };
 
   const copyAddress = () => {
-    if (wallet) {
-      navigator.clipboard.writeText(wallet.address);
+    if (account) {
+      navigator.clipboard.writeText(account.address);
     }
   };
 
@@ -172,7 +101,7 @@ export default function WalletPage() {
     );
   }
 
-  if (!wallet) {
+  if (!connected || !account) {
     return null;
   }
 
@@ -190,15 +119,23 @@ export default function WalletPage() {
             <span className="text-xl font-bold text-white">Trade.apt</span>
           </Link>
 
-          <Link
-            href="/"
-            className="flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 rounded-lg text-gray-400 hover:text-white transition-colors"
-          >
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" />
-            </svg>
-            Back to Trading
-          </Link>
+          <div className="flex items-center gap-4">
+            {/* Network Badge */}
+            <div className="flex items-center gap-2 px-3 py-1 bg-cyan-500/20 border border-cyan-500/50 rounded-full">
+              <span className="w-2 h-2 bg-cyan-400 rounded-full animate-pulse"></span>
+              <span className="text-cyan-400 text-sm font-medium">Devnet</span>
+            </div>
+
+            <Link
+              href="/"
+              className="flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 rounded-lg text-gray-400 hover:text-white transition-colors"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" />
+              </svg>
+              Back to Trading
+            </Link>
+          </div>
         </div>
       </header>
 
@@ -212,12 +149,14 @@ export default function WalletPage() {
           <div className="p-6 border-b border-slate-700 bg-gradient-to-r from-purple-500/10 to-pink-500/10">
             <div className="flex items-center gap-4">
               <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center text-white text-2xl font-bold">
-                {wallet.type[0].toUpperCase()}
+                <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 9V7a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2m2 4h10a2 2 0 002-2v-6a2 2 0 00-2-2H9a2 2 0 00-2 2v6a2 2 0 002 2zm7-5a2 2 0 11-4 0 2 2 0 014 0z" />
+                </svg>
               </div>
               <div>
-                <p className="text-sm text-gray-400 capitalize">{wallet.type} Wallet</p>
+                <p className="text-sm text-gray-400">Connected Wallet</p>
                 <div className="flex items-center gap-2">
-                  <p className="text-xl text-white font-mono">{formatAddress(wallet.address)}</p>
+                  <p className="text-xl text-white font-mono">{formatAddress(account.address, 6)}</p>
                   <button
                     onClick={copyAddress}
                     className="p-1 hover:bg-slate-700 rounded transition-colors"
@@ -236,104 +175,74 @@ export default function WalletPage() {
           <div className="p-6 border-b border-slate-700">
             <p className="text-sm text-gray-400 mb-2">Current Balance</p>
             <div className="flex items-baseline gap-2">
-              <span className="text-4xl font-bold text-white">{wallet.balance.toFixed(4)}</span>
+              <span className="text-4xl font-bold text-white">{balance.toFixed(4)}</span>
               <span className="text-xl text-gray-400">APT</span>
             </div>
-            {wallet.usd_value !== null && (
-              <p className="text-sm text-gray-400 mt-1">
-                Approximately ${wallet.usd_value.toFixed(2)} USD
-              </p>
-            )}
+            <p className="text-sm text-cyan-400 mt-2">Network: Devnet</p>
           </div>
 
-          {/* Network Selection */}
+          {/* Faucet Section */}
           <div className="p-6 border-b border-slate-700">
-            <p className="text-sm text-gray-400 mb-3">Network</p>
-            <div className="grid grid-cols-3 gap-3">
-              {(['mainnet', 'testnet', 'devnet'] as const).map((net) => (
-                <button
-                  key={net}
-                  onClick={() => handleNetworkChange(net)}
-                  className={`py-3 px-4 rounded-xl text-sm font-medium transition-all ${
-                    network === net
-                      ? net === 'mainnet'
-                        ? 'bg-green-500 text-white'
-                        : net === 'testnet'
-                        ? 'bg-yellow-500 text-black'
-                        : 'bg-purple-500 text-white'
-                      : 'bg-slate-700 text-gray-400 hover:bg-slate-600'
-                  }`}
-                >
-                  {net.charAt(0).toUpperCase() + net.slice(1)}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Faucet Section (Testnet/Devnet only) */}
-          {network !== 'mainnet' && (
-            <div className="p-6 border-b border-slate-700">
-              <div className="flex items-center justify-between mb-3">
-                <div>
-                  <p className="text-sm text-gray-400">Testnet Faucet</p>
-                  <p className="text-xs text-gray-500">Get free APT tokens for testing</p>
-                </div>
-                <button
-                  onClick={handleRequestFaucet}
-                  disabled={isFaucetLoading}
-                  className="flex items-center gap-2 px-4 py-2 bg-green-500/20 hover:bg-green-500/30 text-green-400 rounded-lg transition-colors disabled:opacity-50"
-                >
-                  {isFaucetLoading ? (
-                    <>
-                      <div className="w-4 h-4 border-2 border-green-400 border-t-transparent rounded-full animate-spin" />
-                      <span>Requesting...</span>
-                    </>
-                  ) : (
-                    <>
-                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-                      </svg>
-                      <span>Request 1 APT</span>
-                    </>
-                  )}
-                </button>
+            <div className="flex items-center justify-between mb-3">
+              <div>
+                <p className="text-sm text-gray-400">Devnet Faucet</p>
+                <p className="text-xs text-gray-500">Get free APT tokens for testing</p>
               </div>
-
-              {faucetMessage && (
-                <div className={`p-3 rounded-lg ${
-                  faucetMessage.type === 'success' 
-                    ? 'bg-green-500/20 text-green-400' 
-                    : 'bg-red-500/20 text-red-400'
-                }`}>
-                  {faucetMessage.text}
-                </div>
-              )}
-
-              <a
-                href="https://aptoslabs.com/testnet-faucet"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-center gap-2 mt-3 text-sm text-purple-400 hover:text-purple-300"
+              <button
+                onClick={handleRequestFaucet}
+                disabled={isFaucetLoading}
+                className="flex items-center gap-2 px-4 py-2 bg-green-500/20 hover:bg-green-500/30 text-green-400 rounded-lg transition-colors disabled:opacity-50"
               >
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
-                </svg>
-                Official Aptos Faucet
-              </a>
+                {isFaucetLoading ? (
+                  <>
+                    <div className="w-4 h-4 border-2 border-green-400 border-t-transparent rounded-full animate-spin" />
+                    <span>Requesting...</span>
+                  </>
+                ) : (
+                  <>
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
+                    </svg>
+                    <span>Request 1 APT</span>
+                  </>
+                )}
+              </button>
             </div>
-          )}
+
+            {faucetMessage && (
+              <div className={`p-3 rounded-lg ${
+                faucetMessage.type === 'success' 
+                  ? 'bg-green-500/20 text-green-400' 
+                  : 'bg-red-500/20 text-red-400'
+              }`}>
+                {faucetMessage.text}
+              </div>
+            )}
+
+            <a
+              href={FAUCET_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-2 mt-3 text-sm text-purple-400 hover:text-purple-300"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+              </svg>
+              Official Aptos Devnet Faucet
+            </a>
+          </div>
 
           {/* Quick Links */}
           <div className="p-6">
             <p className="text-sm text-gray-400 mb-3">Quick Links</p>
             <div className="space-y-2">
               <a
-                href={`https://explorer.aptoslabs.com/account/${wallet.address}?network=${network}`}
+                href={`${EXPLORER_URL}/account/${account.address}`}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="flex items-center justify-between p-3 bg-slate-700/50 hover:bg-slate-700 rounded-lg transition-colors"
               >
-                <span className="text-white">View on Aptos Explorer</span>
+                <span className="text-white">View on Aptos Explorer (Devnet)</span>
                 <svg className="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
                 </svg>
@@ -364,30 +273,28 @@ export default function WalletPage() {
           Disconnect Wallet
         </button>
 
-        {/* Aptos Info Card */}
+        {/* Devnet Info Card */}
         <div className="mt-8 bg-slate-800/50 backdrop-blur-xl rounded-2xl border border-slate-700 p-6">
-          <h2 className="text-xl font-semibold text-white mb-4">Aptos Network Information</h2>
+          <h2 className="text-xl font-semibold text-white mb-4">About Devnet</h2>
           
           <div className="space-y-4 text-sm text-gray-400">
-            <div>
-              <p className="text-white font-medium mb-1">Mainnet</p>
-              <p>Production network with real value. Use for actual transactions.</p>
-            </div>
-            <div>
-              <p className="text-white font-medium mb-1">Testnet</p>
-              <p>Testing network that mirrors mainnet. Free tokens available from faucet. Perfect for testing trades.</p>
-            </div>
-            <div>
-              <p className="text-white font-medium mb-1">Devnet</p>
-              <p>Development network that resets frequently. Best for developers testing new features.</p>
-            </div>
+            <p>
+              You are connected to the <strong className="text-cyan-400">Aptos Devnet</strong> - a development network 
+              for testing and experimentation.
+            </p>
+            <ul className="list-disc list-inside space-y-2">
+              <li>All tokens are <strong>free test tokens</strong> with no real value</li>
+              <li>Use the faucet to get free APT for testing trades</li>
+              <li>The network may reset periodically, clearing all data</li>
+              <li>Perfect for learning and testing the AI trading assistant</li>
+            </ul>
           </div>
 
-          <div className="mt-6 p-4 bg-purple-500/10 border border-purple-500/30 rounded-lg">
-            <p className="text-purple-400 text-sm">
-              <strong>Tip:</strong> Start with Testnet to practice trading without risking real assets. 
-              Use the faucet to get free APT tokens, then test the AI trading assistant to learn 
-              how it works before moving to Mainnet.
+          <div className="mt-6 p-4 bg-cyan-500/10 border border-cyan-500/30 rounded-lg">
+            <p className="text-cyan-400 text-sm">
+              <strong>Getting Started:</strong> Request free APT from the faucet above, then go back to 
+              the trading dashboard to test AI-powered trading commands like "buy 0.1 APT" or 
+              "what's the price of bitcoin?"
             </p>
           </div>
         </div>
